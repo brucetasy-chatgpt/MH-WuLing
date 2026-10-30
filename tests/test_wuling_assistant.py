@@ -6,8 +6,9 @@ import unittest
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -181,6 +182,110 @@ class BookingSafetyTests(unittest.TestCase):
         checkout_link.click.assert_called_once()
         checkout.click.assert_not_called()
 
+    def test_standby_never_selects_date_before_calibrated_open_time(self):
+        target = datetime(2099, 1, 1, 8, 30, tzinfo=timezone.utc)
+        before = target - timedelta(seconds=1)
+        calls = MagicMock()
+        page = MagicMock()
+        result = {"status": "sold_out", "submitted": False}
+        with patch.object(assistant, "verify_login"), \
+             patch.object(assistant, "guard_path", return_value=Path("missing")), \
+             patch.object(assistant, "existing_submission", return_value=False), \
+             patch.object(assistant, "calibrate_site_clock", return_value={
+                 "offset_seconds": 0.0, "round_trip_ms": 1.0,
+                 "server_date": "date", "measured_at": "now", "samples": 3,
+             }), \
+             patch.object(assistant, "_wait_until_site_time"), \
+             patch.object(
+                 assistant, "_site_now",
+                 side_effect=[before, before, before, target, target],
+             ), \
+             patch.object(
+                 booking, "_browser_prepare_target_month", calls.prepare
+             ), \
+             patch.object(
+                 booking, "_browser_target_date_available", return_value=True
+             ), \
+             patch.object(
+                 booking, "_browser_select_target_date", calls.select
+             ), \
+             patch.object(assistant, "book", return_value=result):
+            actual = assistant.book_at_open(
+                page,
+                self.request,
+                open_at=target,
+                standby_seconds=15,
+                refresh_interval_ms=1500,
+            )
+
+        self.assertEqual(
+            [call.prepare(page, datetime(2099, 12, 31).date()),
+             call.prepare(page, datetime(2099, 12, 31).date()),
+             call.prepare(page, datetime(2099, 12, 31).date()),
+             call.select(page, datetime(2099, 12, 31).date())],
+            calls.mock_calls,
+        )
+        self.assertEqual(2, actual["timing"]["refresh_attempts"])
+
+    def test_standby_backs_off_when_site_requests_slower_actions(self):
+        target = datetime(2099, 1, 1, 8, 30, tzinfo=timezone.utc)
+        page = MagicMock()
+        with patch.object(assistant, "verify_login"), \
+             patch.object(assistant, "guard_path", return_value=Path("missing")), \
+             patch.object(assistant, "existing_submission", return_value=False), \
+             patch.object(assistant, "calibrate_site_clock", return_value={
+                 "offset_seconds": 0.0, "round_trip_ms": 1.0,
+                 "server_date": "date", "measured_at": "now", "samples": 3,
+             }), \
+             patch.object(assistant, "_wait_until_site_time"), \
+             patch.object(
+                 assistant, "_site_now",
+                 side_effect=[target, target, target, target],
+             ), \
+             patch.object(
+                 booking, "_browser_prepare_target_month",
+                 side_effect=[None, booking.BookingError("HTTP 429，請放慢"), None],
+             ), \
+             patch.object(
+                 booking, "_browser_target_date_available", return_value=True
+             ), \
+             patch.object(booking, "_browser_select_target_date"), \
+             patch.object(assistant.secrets, "randbelow", return_value=0), \
+             patch.object(
+                 assistant, "book",
+                 return_value={"status": "sold_out", "submitted": False},
+             ):
+            actual = assistant.book_at_open(
+                page,
+                self.request,
+                open_at=target,
+                standby_seconds=15,
+                refresh_interval_ms=1500,
+            )
+
+        page.wait_for_timeout.assert_called_once_with(3000)
+        self.assertEqual(1, actual["timing"]["throttle_backoffs"])
+        self.assertEqual(3000, actual["timing"]["last_backoff_ms"])
+
+
+class SiteClockTests(unittest.TestCase):
+    def test_http_date_offset_uses_round_trip_midpoint(self):
+        started = datetime(2026, 11, 1, 0, 0, 0, tzinfo=timezone.utc)
+        received = started + timedelta(milliseconds=200)
+        server = datetime(2026, 11, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+        offset = assistant._estimate_site_clock_offset(
+            server, started, received
+        )
+
+        self.assertAlmostEqual(0.4, offset, places=6)
+
+    def test_open_at_requires_explicit_timezone(self):
+        with self.assertRaisesRegex(ValueError, "時區"):
+            assistant._parse_open_at("2026-11-01T08:30:00")
+        parsed = assistant._parse_open_at("2026-11-01T08:30:00+08:00")
+        self.assertEqual(timedelta(hours=8), parsed.utcoffset())
+
 
 class AssistantLifecycleTests(unittest.TestCase):
     def test_payment_tab_stays_visible_while_background_tab_is_prepared(self):
@@ -283,6 +388,16 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(("JOB-STATUS", "status"), pending.get(False, timeout=0))
         self.assertEqual(("JOB-BOOKING", "booking"), pending.get(True, timeout=0))
 
+    def test_future_booking_does_not_block_ready_work(self):
+        pending = assistant.PendingJobs()
+        pending.put(
+            "JOB-FUTURE", "booking", assistant.time.monotonic() + 60
+        )
+        pending.put("JOB-NOW", "booking")
+
+        self.assertEqual(("JOB-NOW", "booking"), pending.get(True, timeout=0))
+        self.assertIsNone(pending.get(True, timeout=0))
+
     def test_recovery_requeues_rehearsal_but_never_live(self):
         with tempfile.TemporaryDirectory() as directory:
             store = assistant.JobStore(Path(directory))
@@ -302,6 +417,22 @@ class QueueTests(unittest.TestCase):
             self.assertEqual(
                 "submit_unknown", store.get(live["id"])["result"]["status"]
             )
+
+    def test_recovery_safely_requeues_live_job_still_in_standby(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = assistant.JobStore(Path(directory))
+            job = store.create("booking", {
+                "mode": "live", "people": 2, "date": "20991231",
+                "open_at": "2099-11-01T08:30:00+08:00",
+                "standby_seconds": 15, "refresh_interval_ms": 1500,
+            })
+            store.update(job["id"], state="running", phase="standby")
+
+            recovered, live_interrupted = store.recover()
+
+            self.assertFalse(live_interrupted)
+            self.assertEqual([job["id"]], [item["id"] for item in recovered])
+            self.assertEqual("queued", store.get(job["id"])["state"])
 
     def test_only_queued_job_can_be_cancelled(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -332,6 +463,51 @@ class QueueTests(unittest.TestCase):
 
 
 class LocalApiTests(unittest.TestCase):
+    def test_scheduled_live_booking_validates_standby_parameters(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = assistant.JobStore(Path(directory))
+            pending = assistant.PendingJobs()
+            state = assistant.ServiceState()
+            stop_event = __import__("threading").Event()
+            token = "test-token"
+            server = assistant.AssistantHttpServer(
+                ("127.0.0.1", 0), token, store, pending, state, stop_event
+            )
+            thread = __import__("threading").Thread(
+                target=server.serve_forever, daemon=True
+            )
+            thread.start()
+            url = f"http://127.0.0.1:{server.server_address[1]}/v1/jobs"
+
+            def request_for(standby):
+                body = json.dumps({
+                    "kind": "booking", "mode": "live", "people": 2,
+                    "date": "20991231",
+                    "open_at": "2099-11-01T08:30:00+08:00",
+                    "standby_seconds": standby,
+                    "refresh_interval_ms": 1500,
+                }).encode("utf-8")
+                return urllib.request.Request(
+                    url, data=body, method="POST",
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Wuling-Token": token,
+                    },
+                )
+
+            try:
+                with urllib.request.urlopen(request_for(15), timeout=3) as response:
+                    created = json.load(response)
+                self.assertEqual(15, created["payload"]["standby_seconds"])
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    urllib.request.urlopen(request_for(9), timeout=3)
+                self.assertEqual(400, caught.exception.code)
+                caught.exception.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
     def test_concurrent_submissions_are_accepted_with_unique_ids(self):
         with tempfile.TemporaryDirectory() as directory:
             store = assistant.JobStore(Path(directory))

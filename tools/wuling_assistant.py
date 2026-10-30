@@ -11,9 +11,11 @@ import re
 import secrets
 import sys
 import threading
+import time
 import uuid
 from dataclasses import asdict, is_dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html.parser import HTMLParser
@@ -29,10 +31,36 @@ GUARDS = booking.PROJECT_ROOT / "Secret" / "booking-guards"
 LOG_DIR = booking.PROJECT_ROOT / "LOG"
 SERVICE_DIR = booking.PROJECT_ROOT / ".wuling-assistant"
 DEFAULT_PORT = 18765
+SCHEDULE_PREPARE_SECONDS = 60
+SCHEDULE_OPEN_GRACE_SECONDS = 30
+SITE_TIME_SAMPLES = 3
 
 
 def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="microseconds")
+
+
+def _parse_open_at(value: str) -> datetime:
+    """Parse an explicit timezone-aware booking release timestamp."""
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError("OpenAt 必須是含時區的 ISO 8601 時間。") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("OpenAt 必須包含時區，例如 2026-11-01T08:30:00+08:00。")
+    return parsed
+
+
+def _scheduled_ready_at(payload: dict[str, Any]) -> float | None:
+    """Return a monotonic queue deadline for scheduled preparation."""
+    value = payload.get("open_at")
+    if not value:
+        return None
+    open_at = _parse_open_at(str(value))
+    seconds = (
+        open_at.astimezone(timezone.utc) - datetime.now(timezone.utc)
+    ).total_seconds() - SCHEDULE_PREPARE_SECONDS
+    return time.monotonic() + max(0.0, seconds)
 
 
 def _json_value(value: Any) -> Any:
@@ -90,6 +118,7 @@ class JobStore:
                 "kind": kind,
                 "payload": _json_value(payload),
                 "state": "queued",
+                "phase": "queued",
                 "created_at": _now(),
                 "started_at": None,
                 "finished_at": None,
@@ -140,7 +169,7 @@ class JobStore:
             if job.get("state") != "queued":
                 raise RuntimeError("只有尚未執行的工作可以取消。")
             return self.update(
-                job_id, state="cancelled", finished_at=_now(),
+                job_id, state="cancelled", phase="cancelled", finished_at=_now(),
                 result={"status": "cancelled"},
             )
 
@@ -152,7 +181,17 @@ class JobStore:
             state = job.get("state")
             if state == "running":
                 payload = job.get("payload") or {}
-                if job.get("kind") == "booking" and payload.get("mode") == "live":
+                safe_scheduled_phase = (
+                    bool(payload.get("open_at"))
+                    and job.get("phase") in {
+                        "calibrating", "preparing", "waiting", "standby"
+                    }
+                )
+                if (
+                    job.get("kind") == "booking"
+                    and payload.get("mode") == "live"
+                    and not safe_scheduled_phase
+                ):
                     job = self.update(
                         job["id"], state="interrupted", finished_at=_now(),
                         result={"status": "submit_unknown"},
@@ -161,7 +200,7 @@ class JobStore:
                     live_interrupted = True
                 else:
                     job = self.update(
-                        job["id"], state="queued", started_at=None,
+                        job["id"], state="queued", phase="queued", started_at=None,
                         error="前次執行中斷，已安全重新排隊。",
                     )
             if job.get("state") == "queued":
@@ -173,12 +212,14 @@ class PendingJobs:
     """FIFO queue that can still service login checks while bookings are paused."""
 
     def __init__(self) -> None:
-        self._items: list[tuple[str, str]] = []
+        self._items: list[tuple[str, str, float | None]] = []
         self._condition = threading.Condition()
 
-    def put(self, job_id: str, kind: str) -> None:
+    def put(
+        self, job_id: str, kind: str, ready_at: float | None = None
+    ) -> None:
         with self._condition:
-            self._items.append((job_id, kind))
+            self._items.append((job_id, kind, ready_at))
             self._condition.notify_all()
 
     def get(self, allow_booking: bool, timeout: float = 0.25) -> tuple[str, str] | None:
@@ -187,11 +228,14 @@ class PendingJobs:
                 self._condition.wait(timeout)
             if not self._items:
                 return None
-            if allow_booking:
-                return self._items.pop(0)
+            now = time.monotonic()
             for index, item in enumerate(self._items):
-                if item[1] == "status":
-                    return self._items.pop(index)
+                job_id, kind, ready_at = item
+                if kind == "status" or (
+                    allow_booking and (ready_at is None or ready_at <= now)
+                ):
+                    self._items.pop(index)
+                    return job_id, kind
             self._condition.wait(timeout)
             return None
 
@@ -332,10 +376,48 @@ class AssistantRequestHandler(BaseHTTPRequestHandler):
                     if stay < date.today():
                         raise ValueError("Date 不可早於今天。")
                     payload = {"mode": mode, "people": people, "date": day}
+                    open_at_value = data.get("open_at")
+                    timing_fields = {
+                        "standby_seconds", "refresh_interval_ms"
+                    } & data.keys()
+                    if open_at_value:
+                        if mode != "live":
+                            raise ValueError("OpenAt 只可用於 Live 模式。")
+                        open_at = _parse_open_at(str(open_at_value))
+                        standby_seconds = data.get("standby_seconds", 15)
+                        refresh_interval_ms = data.get("refresh_interval_ms", 1500)
+                        if (
+                            isinstance(standby_seconds, bool)
+                            or not isinstance(standby_seconds, int)
+                            or not 10 <= standby_seconds <= 20
+                        ):
+                            raise ValueError("StandbySeconds 必須介於 10 到 20。")
+                        if (
+                            isinstance(refresh_interval_ms, bool)
+                            or not isinstance(refresh_interval_ms, int)
+                            or not 1000 <= refresh_interval_ms <= 5000
+                        ):
+                            raise ValueError("RefreshMilliseconds 必須介於 1000 到 5000。")
+                        if open_at.astimezone(timezone.utc) < (
+                            datetime.now(timezone.utc)
+                            - timedelta(seconds=SCHEDULE_OPEN_GRACE_SECONDS)
+                        ):
+                            raise ValueError("OpenAt 已超過可執行時間。")
+                        payload.update({
+                            "open_at": open_at.isoformat(),
+                            "standby_seconds": standby_seconds,
+                            "refresh_interval_ms": refresh_interval_ms,
+                        })
+                    elif timing_fields:
+                        raise ValueError(
+                            "StandbySeconds 與 RefreshMilliseconds 必須搭配 OpenAt。"
+                        )
                 elif kind != "status":
                     raise ValueError("Kind 必須是 booking 或 status。")
                 job = self.server.store.create(kind, payload)
-                self.server.pending.put(job["id"], kind)
+                self.server.pending.put(
+                    job["id"], kind, _scheduled_ready_at(payload)
+                )
                 self._send(HTTPStatus.ACCEPTED, job)
                 return
             match = re.fullmatch(r"/v1/jobs/(JOB-[0-9A-Z-]+)/cancel", path)
@@ -489,7 +571,162 @@ def checkout_matches(page: Any, request: booking.BookingRequest, selected: booki
     )
 
 
-def book(page: Any, request: booking.BookingRequest, rehearsal: bool = False) -> dict[str, Any]:
+def _estimate_site_clock_offset(
+    server_time: datetime,
+    request_started: datetime,
+    response_received: datetime,
+) -> float:
+    """Estimate server-minus-local seconds using the HTTP round-trip midpoint."""
+    if server_time.tzinfo is None or server_time.utcoffset() is None:
+        raise ValueError("網站 Date 標頭缺少時區。")
+    midpoint = request_started + (response_received - request_started) / 2
+    # HTTP-date has one-second precision. Its midpoint is a less biased estimate
+    # than treating the beginning of the reported second as exact.
+    server_midpoint = server_time.astimezone(timezone.utc) + timedelta(seconds=0.5)
+    return (server_midpoint - midpoint.astimezone(timezone.utc)).total_seconds()
+
+
+def calibrate_site_clock(page: Any, samples: int = SITE_TIME_SAMPLES) -> dict[str, Any]:
+    """Measure the official site's HTTP clock and local round-trip uncertainty."""
+    measurements: list[dict[str, Any]] = []
+    for index in range(samples):
+        started = datetime.now(timezone.utc)
+        response = page.request.get(
+            booking.BASE_URL,
+            headers={"Cache-Control": "no-cache"},
+            timeout=15_000,
+        )
+        received = datetime.now(timezone.utc)
+        if not response.ok or not _same_origin(response.url):
+            raise booking.BookingError("無法取得官網時間，Standby 已停止。")
+        date_header = response.headers.get("date")
+        if not date_header:
+            raise booking.BookingError("官網未提供 Date 時間標頭，Standby 已停止。")
+        try:
+            server_time = parsedate_to_datetime(date_header)
+            offset = _estimate_site_clock_offset(server_time, started, received)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise booking.BookingError("官網 Date 時間標頭無法解析，Standby 已停止。") from exc
+        measurements.append({
+            "offset_seconds": offset,
+            "round_trip_ms": (received - started).total_seconds() * 1_000,
+            "server_date": date_header,
+            "measured_at": received.isoformat(timespec="microseconds"),
+        })
+        if index + 1 < samples:
+            page.wait_for_timeout(100)
+    best = min(measurements, key=lambda item: item["round_trip_ms"])
+    return {
+        "offset_seconds": round(float(best["offset_seconds"]), 6),
+        "round_trip_ms": round(float(best["round_trip_ms"]), 3),
+        "server_date": best["server_date"],
+        "measured_at": best["measured_at"],
+        "samples": samples,
+    }
+
+
+def _site_now(offset_seconds: float) -> datetime:
+    return datetime.now(timezone.utc) + timedelta(seconds=offset_seconds)
+
+
+def _wait_until_site_time(
+    page: Any, target: datetime, offset_seconds: float
+) -> None:
+    target_utc = target.astimezone(timezone.utc)
+    while True:
+        remaining = (target_utc - _site_now(offset_seconds)).total_seconds()
+        if remaining <= 0:
+            return
+        page.wait_for_timeout(max(1, min(1_000, int(remaining * 1_000))))
+
+
+def book_at_open(
+    page: Any,
+    request: booking.BookingRequest,
+    *,
+    open_at: datetime,
+    standby_seconds: int,
+    refresh_interval_ms: int,
+    phase_callback: Any | None = None,
+) -> dict[str, Any]:
+    """Prepare early, then refresh without selecting until calibrated open time."""
+    if phase_callback:
+        phase_callback("calibrating")
+    verify_login(page)
+    if guard_path(request).exists() or existing_submission(request):
+        return {"status": "previous_submission", "submitted": False}
+
+    calibration = calibrate_site_clock(page)
+    offset = float(calibration["offset_seconds"])
+    target = open_at.astimezone(timezone.utc)
+    standby_at = target - timedelta(seconds=standby_seconds)
+    timing: dict[str, Any] = {
+        "open_at": open_at.isoformat(),
+        "standby_seconds": standby_seconds,
+        "refresh_interval_ms": refresh_interval_ms,
+        "site_clock": calibration,
+    }
+    if phase_callback:
+        phase_callback("preparing", timing=timing)
+    booking._browser_prepare_target_month(page, date.fromisoformat(request.stay_date))
+    if phase_callback:
+        phase_callback("waiting", timing=timing)
+    _wait_until_site_time(page, standby_at, offset)
+
+    verify_login(page)
+    timing["standby_started_at"] = _site_now(offset).isoformat(
+        timespec="microseconds"
+    )
+    attempts = 0
+    current_refresh_ms = refresh_interval_ms
+    if phase_callback:
+        phase_callback("standby", timing=timing)
+    stay_date = date.fromisoformat(request.stay_date)
+    while _site_now(offset) <= target + timedelta(
+        seconds=SCHEDULE_OPEN_GRACE_SECONDS
+    ):
+        attempts += 1
+        try:
+            booking._browser_prepare_target_month(page, stay_date)
+        except booking.BookingError as exc:
+            if re.search(r"HTTP\s+(?:403|429|503)|放慢", str(exc)):
+                current_refresh_ms = min(5000, current_refresh_ms * 2)
+                timing["throttle_backoffs"] = (
+                    int(timing.get("throttle_backoffs", 0)) + 1
+                )
+                timing["last_backoff_ms"] = current_refresh_ms
+                page.wait_for_timeout(
+                    min(5000, current_refresh_ms + secrets.randbelow(501))
+                )
+                continue
+            raise
+        available = booking._browser_target_date_available(page, stay_date)
+        current_site_time = _site_now(offset)
+        if available and current_site_time >= target:
+            timing["date_available_at"] = current_site_time.isoformat(
+                timespec="microseconds"
+            )
+            timing["refresh_attempts"] = attempts
+            booking._browser_select_target_date(page, stay_date)
+            if phase_callback:
+                phase_callback("booking", timing=timing)
+            result = book(page, request, target_date_selected=True)
+            result["timing"] = timing
+            return result
+        delay_ms = min(5000, current_refresh_ms + secrets.randbelow(501))
+        timing["last_refresh_delay_ms"] = delay_ms
+        page.wait_for_timeout(delay_ms)
+    raise booking.BookingError(
+        f"開放後 {SCHEDULE_OPEN_GRACE_SECONDS} 秒仍未出現目標日期，操作已停止。"
+    )
+
+
+def book(
+    page: Any,
+    request: booking.BookingRequest,
+    rehearsal: bool = False,
+    target_date_selected: bool = False,
+) -> dict[str, Any]:
     """Use the already authenticated page; never automatically retry a submission."""
     verify_login(page)
     if not rehearsal and (guard_path(request).exists() or existing_submission(request)):
@@ -497,7 +734,8 @@ def book(page: Any, request: booking.BookingRequest, rehearsal: bool = False) ->
 
     # Keep the persistent browser on its current page. Calendar navigation now
     # waits for exact month/date DOM updates and falls back home only when needed.
-    booking._browser_open_target_date(page, date.fromisoformat(request.stay_date))
+    if not target_date_selected:
+        booking._browser_open_target_date(page, date.fromisoformat(request.stay_date))
     area = page.locator("#show_room_area")
     area.wait_for(state="visible", timeout=10_000)
     area_html = area.inner_html()
@@ -620,7 +858,9 @@ def _execute_job(
     job_id = job["id"]
     kind = job["kind"]
     state.set(current_job_id=job_id)
-    store.update(job_id, state="running", started_at=_now(), error=None)
+    store.update(
+        job_id, state="running", phase="running", started_at=_now(), error=None
+    )
     print(f"{job_id} 開始執行。", flush=True)
     try:
         if kind == "status":
@@ -643,7 +883,8 @@ def _execute_job(
                 state.set(**changes)
                 result = {"status": "authenticated", "message": "網站已確認登入。"}
             store.update(
-                job_id, state="completed", finished_at=_now(), result=result,
+                job_id, state="completed", phase="completed",
+                finished_at=_now(), result=result,
             )
             print(result["message"], flush=True)
             return
@@ -654,7 +895,20 @@ def _execute_job(
             f"預定武陵國民賓館 {payload['people']}人房，{payload['date']}"
         )
         request = booking.parse_request(command)
-        result = book(page, request, rehearsal=rehearsal)
+        if payload.get("open_at"):
+            def update_phase(phase: str, **changes: Any) -> None:
+                store.update(job_id, phase=phase, **changes)
+
+            result = book_at_open(
+                page,
+                request,
+                open_at=_parse_open_at(str(payload["open_at"])),
+                standby_seconds=int(payload["standby_seconds"]),
+                refresh_interval_ms=int(payload["refresh_interval_ms"]),
+                phase_callback=update_phase,
+            )
+        else:
+            result = book(page, request, rehearsal=rehearsal)
         record = {
             "checked_at": _now(),
             "job_id": job_id,
@@ -665,7 +919,8 @@ def _execute_job(
         log_path = booking.save_result(record, LOG_DIR)
         result["log"] = str(log_path)
         store.update(
-            job_id, state="completed", finished_at=_now(), result=result,
+            job_id, state="completed", phase="completed",
+            finished_at=_now(), result=result,
         )
         if result.get("status") == "submit_unknown":
             state.set(pause_reason="submission_unknown")
@@ -677,18 +932,19 @@ def _execute_job(
         state.set(login_status="login_required", pause_reason=pause_reason)
         result = {"status": "login_required", "message": str(exc)}
         store.update(
-            job_id, state="completed", finished_at=_now(), result=result,
+            job_id, state="completed", phase="completed",
+            finished_at=_now(), result=result,
         )
         print(str(exc), flush=True)
     except booking.BookingError as exc:
         store.update(
-            job_id, state="failed", finished_at=_now(),
+            job_id, state="failed", phase="failed", finished_at=_now(),
             error=str(exc), result={"status": "error", "message": str(exc)},
         )
         print(f"{job_id} 操作停止：{exc}", flush=True)
     except Exception as exc:
         store.update(
-            job_id, state="failed", finished_at=_now(),
+            job_id, state="failed", phase="failed", finished_at=_now(),
             error=f"{type(exc).__name__}: {exc}",
             result={"status": "error", "message": "網站或瀏覽器操作失敗。"},
         )
@@ -751,7 +1007,10 @@ def run_assistant(
     if live_interrupted:
         state.set(pause_reason="submission_unknown")
     for job in recovered:
-        pending.put(job["id"], job["kind"])
+        pending.put(
+            job["id"], job["kind"],
+            _scheduled_ready_at(job.get("payload") or {}),
+        )
     token = secrets.token_urlsafe(32)
     try:
         server = AssistantHttpServer(

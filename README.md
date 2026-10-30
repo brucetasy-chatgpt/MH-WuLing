@@ -34,7 +34,17 @@
 Copy-Item .\Secret\Secret.example.ini .\Secret\Secret.ini
 ```
 
-在 `Secret\Secret.ini` 填入 `Phone` 與 `pwd` 可讓助手嘗試自動登入；未填或自動登入失敗時，也可以直接在助手開啟的瀏覽器中手動登入。請勿提交 `Secret.ini`、密碼、Session、瀏覽器資料或訂房紀錄。
+在 `Secret\Secret.ini` 集中填入登入與搶訂時間設定：
+
+```ini
+Phone=你的電話
+pwd=你的密碼
+booking_open_at=2026-11-01 08:30:00 +08:00
+booking_standby_seconds=15
+booking_refresh_milliseconds=1500
+```
+
+`Phone` 與 `pwd` 可讓助手嘗試自動登入；未填或自動登入失敗時，也可以直接在助手開啟的瀏覽器中手動登入。請勿提交 `Secret.ini`、密碼、Session、瀏覽器資料或訂房紀錄。
 
 ## 標準操作流程
 
@@ -99,6 +109,19 @@ Copy-Item .\Secret\Secret.example.ini .\Secret\Secret.ini
 ```
 
 `Live` 會在每筆工作開始、加入房型前及最後送單前重新確認登入。它只會在能核對目標日期、選定房型且結帳頁中只有一個房間時嘗試送出；任何核對失敗都會停止該工作。
+
+#### 開放時間 Standby
+
+若官網在指定時間才釋出日期，可提前排程，不要等開放後才輸入命令。例如官網於 2026-11-01 上午 08:30（台灣時間）開放：
+
+```powershell
+.\PS\Invoke-WulingAssistant.ps1 `
+    -Mode Live -People 2 -Date 20261230,20261231 -Wait
+```
+
+Live 模式預設讀取 `Secret.ini` 的 `booking_open_at`、`booking_standby_seconds` 與 `booking_refresh_milliseconds`。命令列的 `-OpenAt`（別名 `-BookingTime`）、`-StandbySeconds`、`-RefreshMilliseconds` 可覆寫個別設定；明確指定 `-OpenAt ""` 可略過設定檔時間並立即執行。`StandbySeconds` 限定為 10–20 秒；`RefreshMilliseconds` 限定為 1000–5000 毫秒。刷新會在基準值上隨機增加 0–500 毫秒，避免固定頻率；遇到 HTTP 403、429、503 或網站要求放慢時會自動倍增退避，最多 5 秒。助手會在開放前先確認登入、以官網 HTTPS 回應的 `Date` 標頭和網路往返中點校準網站時間，並把日曆預先切到目標月份。進入最後 Standby 窗口後只刷新日曆，不會提早選日期；校準後的網站時間到達 `OpenAt` 且日期按鈕出現，才會選擇日期、核對房型並沿用既有 Live 安全流程送單。
+
+多個日期仍依佇列逐筆處理，不會同時送出。第一筆成功暫時保留後，付款頁籤會留在前景，助手再於背景頁籤處理下一筆。排程工作可提前加入；`-Wait` 的逾時會從 `OpenAt` 起算，因此可跨日等待。修改助手程式後必須安全停止並重新啟動，執行中的舊程序不會自動載入新版本。
 
 結果判讀：
 

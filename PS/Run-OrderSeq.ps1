@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory = $true)]
     [ValidateSet("start", "result", "next", "status", "reset")]
     [string]$Command,

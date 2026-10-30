@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$InputPath,
     [string]$OutputPath,
     [string]$Selector,

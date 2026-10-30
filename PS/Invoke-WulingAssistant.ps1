@@ -1,4 +1,4 @@
-param(
+﻿param(
     [ValidateSet("Status", "Jobs", "Cancel", "Stop", "Resume")]
     [string]$Action,
 
@@ -9,6 +9,15 @@ param(
     [int]$People,
 
     [string[]]$Date,
+
+    [Alias("BookingTime")]
+    [string]$OpenAt,
+
+    [ValidateRange(10, 20)]
+    [int]$StandbySeconds = 15,
+
+    [ValidateRange(1000, 5000)]
+    [int]$RefreshMilliseconds = 1500,
 
     [string]$JobId,
 
@@ -27,6 +36,24 @@ $ErrorActionPreference = "Stop"
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $runtimePath = Join-Path $projectRoot ".wuling-assistant\runtime.json"
+$configPath = Join-Path $projectRoot "Secret\Secret.ini"
+
+function Get-AssistantBookingConfig {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $values = @{}
+    if (-not (Test-Path -LiteralPath $Path)) { return $values }
+    foreach ($line in Get-Content -LiteralPath $Path -Encoding UTF8) {
+        $trimmed = $line.Trim()
+        if (-not $trimmed -or $trimmed.StartsWith(";") -or
+            $trimmed.StartsWith("#") -or -not $trimmed.Contains("=")) {
+            continue
+        }
+        $parts = $trimmed.Split("=", 2)
+        $values[$parts[0].Trim().ToLowerInvariant()] = $parts[1].Trim()
+    }
+    return $values
+}
 
 if (-not (Test-Path -LiteralPath $runtimePath)) {
     throw "訂房助手尚未啟動。請先執行 .\PS\Start-WulingAssistant.ps1。"
@@ -90,6 +117,12 @@ function Get-AssistantJob {
 function Wait-AssistantJob {
     param([Parameter(Mandatory = $true)][string]$Id)
     $deadline = [DateTimeOffset]::Now.AddSeconds($TimeoutSeconds)
+    $initial = Get-AssistantJob -Id $Id
+    if ($initial.payload.open_at) {
+        $scheduledOpen = [DateTimeOffset]::Parse([string]$initial.payload.open_at)
+        $scheduledDeadline = $scheduledOpen.AddSeconds($TimeoutSeconds)
+        if ($scheduledDeadline -gt $deadline) { $deadline = $scheduledDeadline }
+    }
     while ([DateTimeOffset]::Now -lt $deadline) {
         $job = Get-AssistantJob -Id $Id
         if ($job.state -in @("completed", "failed", "cancelled", "interrupted")) {
@@ -107,11 +140,15 @@ function Write-AssistantJobResult {
         return
     }
     if ($Job.state -eq "queued") {
-        Write-Output "$($Job.id) 已加入佇列"
+        if ($Job.payload.open_at) {
+            Write-Output "$($Job.id) 已排程，將於 $($Job.payload.open_at) 開放前進入 Standby"
+        } else {
+            Write-Output "$($Job.id) 已加入佇列"
+        }
         return
     }
     if ($Job.state -eq "running") {
-        Write-Output "$($Job.id) 執行中"
+        Write-Output "$($Job.id) 執行中（$($Job.phase)）"
         return
     }
     $status = [string]$Job.result.status
@@ -150,8 +187,10 @@ function Write-AssistantJobResult {
 $null = Invoke-AssistantApi -Method Get -Path "/v1/health"
 
 if ($Action) {
-    if ($Mode -or $PSBoundParameters.ContainsKey("People") -or $Date) {
-        throw "-Action 不可與 -Mode、-People 或 -Date 同時使用。"
+    if ($Mode -or $PSBoundParameters.ContainsKey("People") -or $Date -or
+        $OpenAt -or $PSBoundParameters.ContainsKey("StandbySeconds") -or
+        $PSBoundParameters.ContainsKey("RefreshMilliseconds")) {
+        throw "-Action 不可與訂房參數同時使用。"
     }
     switch ($Action) {
         "Status" {
@@ -169,9 +208,11 @@ if ($Action) {
             } else {
                 $response.jobs |
                     Select-Object id, state, kind, created_at,
+                        phase,
                         @{ Name = "mode"; Expression = { $_.payload.mode } },
                         @{ Name = "people"; Expression = { $_.payload.people } },
                         @{ Name = "date"; Expression = { $_.payload.date } },
+                        @{ Name = "open_at"; Expression = { $_.payload.open_at } },
                         @{ Name = "result"; Expression = { $_.result.status } } |
                     Format-Table -AutoSize
             }
@@ -204,17 +245,78 @@ if (-not $PSBoundParameters.ContainsKey("People")) { throw "訂房工作必須�
 if (-not $Date -or $Date.Count -eq 0) { throw "訂房工作必須指定 -Date YYYYMMDD。" }
 if ($JobId) { throw "提交訂房工作時不可指定 -JobId。" }
 
+$bookingConfig = Get-AssistantBookingConfig -Path $configPath
+$effectiveOpenAt = $null
+$effectiveStandbySeconds = $StandbySeconds
+$effectiveRefreshMilliseconds = $RefreshMilliseconds
+if ($Mode -ne "Live" -and $PSBoundParameters.ContainsKey("OpenAt")) {
+    throw "-OpenAt 只可搭配 -Mode Live。"
+}
+if ($Mode -eq "Live") {
+    $effectiveOpenAt = if ($PSBoundParameters.ContainsKey("OpenAt")) {
+        $OpenAt
+    } else {
+        [string]$bookingConfig["booking_open_at"]
+    }
+    if (-not $PSBoundParameters.ContainsKey("StandbySeconds") -and
+        $bookingConfig["booking_standby_seconds"]) {
+        $configuredStandby = 0
+        if (-not [int]::TryParse(
+            [string]$bookingConfig["booking_standby_seconds"],
+            [ref]$configuredStandby
+        ) -or $configuredStandby -lt 10 -or $configuredStandby -gt 20) {
+            throw "Secret.ini 的 booking_standby_seconds 必須介於 10 到 20。"
+        }
+        $effectiveStandbySeconds = $configuredStandby
+    }
+    if (-not $PSBoundParameters.ContainsKey("RefreshMilliseconds") -and
+        $bookingConfig["booking_refresh_milliseconds"]) {
+        $configuredRefresh = 0
+        if (-not [int]::TryParse(
+            [string]$bookingConfig["booking_refresh_milliseconds"],
+            [ref]$configuredRefresh
+        ) -or $configuredRefresh -lt 1000 -or $configuredRefresh -gt 5000) {
+            throw "Secret.ini 的 booking_refresh_milliseconds 必須介於 1000 到 5000。"
+        }
+        $effectiveRefreshMilliseconds = $configuredRefresh
+    }
+}
+
+$openAtIso = $null
+if ($effectiveOpenAt) {
+    $parsedOpenAt = [DateTimeOffset]::MinValue
+    $parsed = [DateTimeOffset]::TryParse(
+        $effectiveOpenAt,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::AssumeLocal,
+        [ref]$parsedOpenAt
+    )
+    if (-not $parsed) {
+        throw "OpenAt 格式錯誤；例如：2026-11-01 08:30:00。"
+    }
+    $openAtIso = $parsedOpenAt.ToString("o")
+} elseif ($PSBoundParameters.ContainsKey("StandbySeconds") -or
+          $PSBoundParameters.ContainsKey("RefreshMilliseconds")) {
+    throw "-StandbySeconds 與 -RefreshMilliseconds 必須搭配 -OpenAt。"
+}
+
 $submitted = @()
 foreach ($day in $Date) {
     if ($day -notmatch '^20\d{6}$') {
         throw "Date 必須是 YYYYMMDD：$day"
     }
-    $submitted += Invoke-AssistantApi -Method Post -Path "/v1/jobs" -Body @{
+    $body = @{
         kind   = "booking"
         mode   = $Mode.ToLowerInvariant()
         people = $People
         date   = $day
     }
+    if ($openAtIso) {
+        $body.open_at = $openAtIso
+        $body.standby_seconds = $effectiveStandbySeconds
+        $body.refresh_interval_ms = $effectiveRefreshMilliseconds
+    }
+    $submitted += Invoke-AssistantApi -Method Post -Path "/v1/jobs" -Body $body
 }
 
 if ($Wait) {

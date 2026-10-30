@@ -401,7 +401,8 @@ def _browser_login(page: Any, config: dict[str, str]) -> bool:
     return False
 
 
-def _browser_open_target_date(page: Any, stay_date: date) -> None:
+def _browser_prepare_target_month(page: Any, stay_date: date) -> None:
+    """Open the booking calendar at the target month without selecting a date."""
     # The site explicitly rejects clicks issued too quickly. Use real DOM clicks
     # and keep a small server-friendly interval between every calendar action.
     wait_site_action_delay(page)
@@ -441,8 +442,18 @@ def _browser_open_target_date(page: Any, stay_date: date) -> None:
         _wait_for_calendar_month(page, expected_year, expected_month)
         current_year, current_month = expected_year, expected_month
         wait_site_action_delay(page)
+
+
+def _browser_target_date_available(page: Any, stay_date: date) -> bool:
+    """Return whether the target date is currently exposed by the site calendar."""
     selector = f"#calendar_day{stay_date.day:02d}"
-    if page.locator(selector).count() == 0:
+    return page.locator(selector).count() == 1
+
+
+def _browser_select_target_date(page: Any, stay_date: date) -> None:
+    """Select a date that the caller has already observed in the target month."""
+    selector = f"#calendar_day{stay_date.day:02d}"
+    if not _browser_target_date_available(page, stay_date):
         raise BookingError("目標日期目前不在可選日曆中，操作已停止。")
     with page.expect_response(
         lambda response: "change_date.php?number=" in response.url,
@@ -452,6 +463,11 @@ def _browser_open_target_date(page: Any, stay_date: date) -> None:
     _finish_site_response(response_info, "選擇住宿日期")
     _wait_for_inventory_date(page, stay_date)
     wait_site_action_delay(page)
+
+
+def _browser_open_target_date(page: Any, stay_date: date) -> None:
+    _browser_prepare_target_month(page, stay_date)
+    _browser_select_target_date(page, stay_date)
 
 
 def wait_site_action_delay(page: Any) -> int:

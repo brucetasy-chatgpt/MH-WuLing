@@ -1,3 +1,5 @@
+﻿#requires -Version 5.1
+
 param(
     [ValidateRange(1, 65535)]
     [int]$Port = 18765

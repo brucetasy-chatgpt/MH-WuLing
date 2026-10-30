@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$ConfigPath,
     [string]$LogDir,
     [switch]$OpenLoginOnFail
