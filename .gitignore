@@ -1,0 +1,14 @@
+.venv/
+.playwright-mcp/
+.wuling-browser-profile/
+.wuling-assistant/
+__pycache__/
+*.py[cod]
+debug.log
+
+Secret/*
+!Secret/Secret.example.ini
+
+LOG/*
+IMAGE/*
+!IMAGE/.gitkeep
