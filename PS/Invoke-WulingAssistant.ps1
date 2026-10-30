@@ -114,12 +114,25 @@ function Get-AssistantJob {
     return Invoke-AssistantApi -Method Get -Path "/v1/jobs/$($Id.ToUpperInvariant())"
 }
 
+function Get-OptionalPropertyValue {
+    param(
+        [object]$InputObject,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+    if ($null -eq $InputObject) { return $null }
+    $property = $InputObject.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
 function Wait-AssistantJob {
     param([Parameter(Mandatory = $true)][string]$Id)
     $deadline = [DateTimeOffset]::Now.AddSeconds($TimeoutSeconds)
     $initial = Get-AssistantJob -Id $Id
-    if ($initial.payload.open_at) {
-        $scheduledOpen = [DateTimeOffset]::Parse([string]$initial.payload.open_at)
+    $scheduledOpenAt = Get-OptionalPropertyValue `
+        -InputObject $initial.payload -Name "open_at"
+    if ($scheduledOpenAt) {
+        $scheduledOpen = [DateTimeOffset]::Parse([string]$scheduledOpenAt)
         $scheduledDeadline = $scheduledOpen.AddSeconds($TimeoutSeconds)
         if ($scheduledDeadline -gt $deadline) { $deadline = $scheduledDeadline }
     }
@@ -140,15 +153,19 @@ function Write-AssistantJobResult {
         return
     }
     if ($Job.state -eq "queued") {
-        if ($Job.payload.open_at) {
-            Write-Output "$($Job.id) 已排程，將於 $($Job.payload.open_at) 開放前進入 Standby"
+        $queuedOpenAt = Get-OptionalPropertyValue `
+            -InputObject $Job.payload -Name "open_at"
+        if ($queuedOpenAt) {
+            Write-Output "$($Job.id) 已排程，將於 $queuedOpenAt 開放前進入 Standby"
         } else {
             Write-Output "$($Job.id) 已加入佇列"
         }
         return
     }
     if ($Job.state -eq "running") {
-        Write-Output "$($Job.id) 執行中（$($Job.phase)）"
+        $phase = Get-OptionalPropertyValue -InputObject $Job -Name "phase"
+        if (-not $phase) { $phase = "running" }
+        Write-Output "$($Job.id) 執行中（$phase）"
         return
     }
     $status = [string]$Job.result.status
@@ -208,12 +225,24 @@ if ($Action) {
             } else {
                 $response.jobs |
                     Select-Object id, state, kind, created_at,
-                        phase,
-                        @{ Name = "mode"; Expression = { $_.payload.mode } },
-                        @{ Name = "people"; Expression = { $_.payload.people } },
-                        @{ Name = "date"; Expression = { $_.payload.date } },
-                        @{ Name = "open_at"; Expression = { $_.payload.open_at } },
-                        @{ Name = "result"; Expression = { $_.result.status } } |
+                        @{ Name = "phase"; Expression = {
+                            Get-OptionalPropertyValue -InputObject $_ -Name "phase"
+                        } },
+                        @{ Name = "mode"; Expression = {
+                            Get-OptionalPropertyValue -InputObject $_.payload -Name "mode"
+                        } },
+                        @{ Name = "people"; Expression = {
+                            Get-OptionalPropertyValue -InputObject $_.payload -Name "people"
+                        } },
+                        @{ Name = "date"; Expression = {
+                            Get-OptionalPropertyValue -InputObject $_.payload -Name "date"
+                        } },
+                        @{ Name = "open_at"; Expression = {
+                            Get-OptionalPropertyValue -InputObject $_.payload -Name "open_at"
+                        } },
+                        @{ Name = "result"; Expression = {
+                            Get-OptionalPropertyValue -InputObject $_.result -Name "status"
+                        } } |
                     Format-Table -AutoSize
             }
         }

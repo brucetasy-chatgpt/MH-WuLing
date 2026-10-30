@@ -23,6 +23,7 @@
 ### 修正
 
 - 所有 PowerShell 腳本轉為 UTF-8 BOM，避免 Windows PowerShell 5.1 將中文誤判為 Big5 而產生 ParserError。
+- 修正 Rehearsal 工作沒有 `open_at` 時，`-Wait` 在 StrictMode 下讀取不存在屬性而中止。
 - 排程工作在尚未到達準備時間時不會阻塞已可執行的狀態工作。
 - Standby 階段中斷可安全重新排隊；進入實際訂房階段後仍維持禁止自動重送的安全策略。
 
