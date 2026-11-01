@@ -16,6 +16,23 @@ SPEC.loader.exec_module(MODULE)
 
 
 class BookingCommandTests(unittest.TestCase):
+    def test_extracts_and_validates_numbered_shard_redirect(self) -> None:
+        body = (
+            '<meta http-equiv="refresh" '
+            'content="1;url=https://whotel002.wuling-farm.com.tw/whotel">'
+        )
+        target = MODULE.site_redirect_url(body)
+        self.assertEqual("https://whotel002.wuling-farm.com.tw/whotel", target)
+        self.assertEqual(
+            "https://whotel002.wuling-farm.com.tw/whotel/",
+            MODULE.site_base_url(target),
+        )
+
+    def test_rejects_untrusted_meta_refresh_target(self) -> None:
+        body = '<meta http-equiv="refresh" content="0;url=https://example.com/whotel">'
+        with self.assertRaises(MODULE.BookingError):
+            MODULE.site_redirect_url(body)
+
     def test_parses_requested_command(self) -> None:
         request = MODULE.parse_request("預定武陵國民賓館 4人房，20991231。")
         self.assertEqual(4, request.people)

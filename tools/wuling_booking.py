@@ -9,6 +9,7 @@ out, before reading credentials or starting a browser.
 from __future__ import annotations
 
 import argparse
+import html
 import http.cookiejar
 import json
 import random
@@ -26,6 +27,7 @@ from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 BASE_URL = "https://whotel.wuling-farm.com.tw/whotel/"
+SITE_HOST_PATTERN = re.compile(r"^whotel(?:\d+)?\.wuling-farm\.com\.tw$", re.I)
 COMMAND_PATTERN = re.compile(
     r"^\s*(?:預定|預訂)\s*武陵國民賓館\s*"
     r"(?P<people>\d+)\s*人房\s*[，,]?\s*"
@@ -108,13 +110,20 @@ class AvailabilityClient:
         )
         self.timeout = timeout
         self.headers = {"User-Agent": "MH-WuLing-Rehearsal/1.0"}
+        self.base_url = BASE_URL
 
     def _get_text(self, relative_url: str) -> str:
-        url = urllib.parse.urljoin(BASE_URL, relative_url)
-        request = urllib.request.Request(url, headers=self.headers)
-        with self.opener.open(request, timeout=self.timeout) as response:
-            charset = response.headers.get_content_charset() or "utf-8"
-            return response.read().decode(charset, errors="replace")
+        for _ in range(3):
+            url = urllib.parse.urljoin(self.base_url, relative_url)
+            request = urllib.request.Request(url, headers=self.headers)
+            with self.opener.open(request, timeout=self.timeout) as response:
+                charset = response.headers.get_content_charset() or "utf-8"
+                body = response.read().decode(charset, errors="replace")
+            redirected = site_redirect_url(body, url)
+            if redirected is None:
+                return body
+            self.base_url = site_base_url(redirected)
+        raise BookingError("官網分流導向次數過多，操作已停止。")
 
     def _get_json_html(self, relative_url: str) -> str:
         payload = json.loads(self._get_text(relative_url))
@@ -181,7 +190,7 @@ def search_with_browser(stay_date: date, people: int) -> dict[str, Any]:
         browser = playwright.chromium.launch(headless=True)
         try:
             page = browser.new_page(locale="zh-TW")
-            page.goto(BASE_URL, wait_until="domcontentloaded", timeout=20_000)
+            browser_open_site(page)
             calendar_html = page.evaluate(
                 "async () => await (await fetch('func_select.php?func=1')).json()"
             )
@@ -360,6 +369,57 @@ def load_config(path: Path) -> dict[str, str]:
     return values
 
 
+def site_base_url(url: str) -> str:
+    """Return a validated booking root for either the entry host or a numbered shard."""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        raise BookingError("官網分流網址不是安全的 HTTPS 網址，操作已停止。")
+    if not SITE_HOST_PATTERN.fullmatch(parsed.hostname):
+        raise BookingError("官網分流至非預期網域，操作已停止。")
+    normalized_path = parsed.path.rstrip("/")
+    if normalized_path != "/whotel" and not normalized_path.startswith("/whotel/"):
+        raise BookingError("官網分流路徑異常，操作已停止。")
+    return f"https://{parsed.netloc}/whotel/"
+
+
+def site_redirect_url(body: str, source_url: str = BASE_URL) -> str | None:
+    """Extract the official meta-refresh shard without trusting arbitrary targets."""
+    match = re.search(
+        r"<meta\b[^>]*\bhttp-equiv\s*=\s*['\"]?refresh['\"]?[^>]*"
+        r"\bcontent\s*=\s*['\"]([^'\"]+)['\"]",
+        body,
+        re.I,
+    )
+    if not match:
+        # Attribute order is not significant in HTML; support content before http-equiv.
+        tag = re.search(r"<meta\b[^>]*http-equiv\s*=\s*['\"]?refresh['\"]?[^>]*>", body, re.I)
+        if not tag:
+            return None
+        content = re.search(r"\bcontent\s*=\s*['\"]([^'\"]+)['\"]", tag.group(0), re.I)
+        if not content:
+            return None
+        value = content.group(1)
+    else:
+        value = match.group(1)
+    target = re.search(r"(?:^|;)\s*url\s*=\s*(.+?)\s*$", html.unescape(value), re.I)
+    if not target:
+        return None
+    resolved = urllib.parse.urljoin(source_url, target.group(1).strip(" '\""))
+    site_base_url(resolved)
+    return resolved
+
+
+def browser_site_base_url(page: Any) -> str:
+    return site_base_url(str(page.url))
+
+
+def browser_open_site(page: Any, base_url: str | None = None) -> str:
+    """Open the entry point, wait through its meta-refresh, and pin the selected shard."""
+    page.goto(base_url or BASE_URL, wait_until="domcontentloaded", timeout=20_000)
+    page.locator("#wlogin_name").wait_for(state="attached", timeout=20_000)
+    return browser_site_base_url(page)
+
+
 def _is_logged_in(page: Any) -> bool:
     login_name = page.locator("#wlogin_name")
     return login_name.count() > 0 and "未登入" not in login_name.inner_text()
@@ -410,7 +470,7 @@ def _browser_prepare_target_month(page: Any, stay_date: date) -> None:
     if date_nav.count() == 0:
         # Normal persistent-assistant jobs stay on the current same-origin page.
         # Fall back to the home page only if the shared navigation is unavailable.
-        page.goto(BASE_URL, wait_until="domcontentloaded", timeout=20_000)
+        browser_open_site(page, browser_site_base_url(page))
         date_nav = page.locator("a[onclick*='func_click(1)']")
         date_nav.wait_for(state="visible", timeout=10_000)
         wait_site_action_delay(page)
@@ -562,7 +622,7 @@ def execute_live_booking(
                     ]
                 )
             page = context.new_page()
-            page.goto(BASE_URL, wait_until="domcontentloaded", timeout=20_000)
+            browser_open_site(page)
             if not _is_logged_in(page) and not _browser_login(page, config):
                 return {"status": "login_failed", "submitted": False}
 
@@ -669,7 +729,7 @@ def verify_existing_booking(
                     ]
                 )
             page = context.new_page()
-            page.goto(BASE_URL, wait_until="domcontentloaded", timeout=20_000)
+            browser_open_site(page)
             if not _is_logged_in(page) and not _browser_login(page, config):
                 return {"status": "verify_login_failed", "submitted": False}
 

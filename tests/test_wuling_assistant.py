@@ -30,9 +30,12 @@ class FakeResponse:
         return self.body
 
 
-def auth_page(home, orders):
+def auth_page(home, orders, base_url=booking.BASE_URL):
     page = MagicMock()
-    page.request.get.side_effect = [FakeResponse(home), FakeResponse(orders)]
+    page.url = base_url
+    page.request.get.side_effect = [
+        FakeResponse(home, url=base_url), FakeResponse(orders, url=base_url)
+    ]
     return page
 
 
@@ -41,6 +44,20 @@ class LoginTests(unittest.TestCase):
         page = auth_page("<a id='wlogin_name'>會員</a>", "<p>訂單查詢</p>")
         assistant.verify_login(page)
         self.assertEqual(2, page.request.get.call_count)
+
+    def test_numbered_shard_is_used_for_all_login_checks(self):
+        base_url = "https://whotel002.wuling-farm.com.tw/whotel/"
+        page = auth_page(
+            "<a id='wlogin_name'>會員</a>", "<p>訂單查詢</p>", base_url
+        )
+
+        assistant.verify_login(page)
+
+        self.assertEqual(base_url, page.request.get.call_args_list[0].args[0])
+        self.assertEqual(
+            base_url + "func_select.php?func=6",
+            page.request.get.call_args_list[1].args[0],
+        )
 
     def test_visitor_and_stale_order_session_are_rejected(self):
         visitor = auth_page("<a id='wlogin_name'>未登入</a>", "<p>訂單</p>")
@@ -59,6 +76,7 @@ class LoginTests(unittest.TestCase):
 
     def test_transient_transport_failure_is_retried_once(self):
         page = MagicMock()
+        page.url = booking.BASE_URL
         page.request.get.side_effect = [
             TimeoutError("temporary"),
             FakeResponse("<a id='wlogin_name'>會員</a>"),
@@ -75,6 +93,7 @@ class BookingSafetyTests(unittest.TestCase):
     def setUp(self):
         self.request = booking.BookingRequest("測試", "武陵國民賓館", 4, "2099-12-31")
         self.page = MagicMock()
+        self.page.url = booking.BASE_URL
 
     def test_temporary_hold_is_classified_as_pending_payment(self):
         result = assistant.classify_submission_response(
@@ -302,6 +321,7 @@ class AssistantLifecycleTests(unittest.TestCase):
     def test_browser_closes_only_after_service_stop(self):
         context = MagicMock()
         page = MagicMock()
+        page.url = booking.BASE_URL
         context.pages = [page]
         playwright = MagicMock()
         playwright.chromium.launch_persistent_context.return_value = context

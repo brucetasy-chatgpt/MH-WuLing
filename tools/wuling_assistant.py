@@ -21,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urljoin
 
 import wuling_booking as booking
 
@@ -479,14 +479,17 @@ class _LoginNameParser(HTMLParser):
             self.parts.append(data)
 
 
-def _same_origin(url: str) -> bool:
-    parsed = urlsplit(url)
-    return parsed.scheme == "https" and parsed.hostname == "whotel.wuling-farm.com.tw"
+def _same_origin(url: str, base_url: str) -> bool:
+    try:
+        return booking.site_base_url(url) == booking.site_base_url(base_url)
+    except booking.BookingError:
+        return False
 
 
 def _verify_login_once(page: Any) -> None:
-    home = page.request.get(booking.BASE_URL, timeout=15_000)
-    if not home.ok or not _same_origin(home.url):
+    base_url = booking.browser_site_base_url(page)
+    home = page.request.get(base_url, timeout=15_000)
+    if not home.ok or not _same_origin(home.url, base_url):
         raise AuthError("無法驗證網站登入回應。")
     parser = _LoginNameParser()
     parser.feed(home.text())
@@ -496,9 +499,9 @@ def _verify_login_once(page: Any) -> None:
 
     booking.wait_site_action_delay(page)
     response = page.request.get(
-        urljoin(booking.BASE_URL, "func_select.php?func=6"), timeout=15_000
+        urljoin(base_url, "func_select.php?func=6"), timeout=15_000
     )
-    if not response.ok or not _same_origin(response.url):
+    if not response.ok or not _same_origin(response.url, base_url):
         raise AuthError("登入檢查請求失敗，暫停操作。")
     content = response.json()
     if not isinstance(content, str):
@@ -589,15 +592,16 @@ def _estimate_site_clock_offset(
 def calibrate_site_clock(page: Any, samples: int = SITE_TIME_SAMPLES) -> dict[str, Any]:
     """Measure the official site's HTTP clock and local round-trip uncertainty."""
     measurements: list[dict[str, Any]] = []
+    base_url = booking.browser_site_base_url(page)
     for index in range(samples):
         started = datetime.now(timezone.utc)
         response = page.request.get(
-            booking.BASE_URL,
+            base_url,
             headers={"Cache-Control": "no-cache"},
             timeout=15_000,
         )
         received = datetime.now(timezone.utc)
-        if not response.ok or not _same_origin(response.url):
+        if not response.ok or not _same_origin(response.url, base_url):
             raise booking.BookingError("無法取得官網時間，Standby 已停止。")
         date_header = response.headers.get("date")
         if not date_header:
@@ -1040,7 +1044,8 @@ def run_assistant(
             _write_runtime_file(runtime_file, actual_port, token, state)
             try:
                 page = context.pages[0] if context.pages else context.new_page()
-                page.goto(booking.BASE_URL, wait_until="domcontentloaded", timeout=20_000)
+                active_base_url = booking.browser_open_site(page)
+                print(f"已進入官網分流站：{active_base_url}", flush=True)
                 print("瀏覽器已啟動；請於視窗登入。", flush=True)
                 print(
                     "命令介面：.\\PS\\Invoke-WulingAssistant.ps1 -Action Status",
